@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Barcode Scanner → Google Sheet</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    body { margin: 0; background: #0b0c10; color: #eaf0ff; }
+    header { padding: 14px 14px 10px; position: sticky; top: 0; background: rgba(11,12,16,.92); backdrop-filter: blur(10px); border-bottom: 1px solid rgba(255,255,255,.08); }
+    h1 { margin: 0 0 8px; font-size: 16px; font-weight: 700; letter-spacing: .2px; }
+    .row { display:flex; gap:10px; flex-wrap: wrap; align-items: center; }
+    input, select, button {
+      height: 42px; border-radius: 10px; border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.06); color: #eaf0ff; padding: 0 12px; font-size: 14px;
+      outline: none;
+    }
+    input::placeholder { color: rgba(234,240,255,.55); }
+    button { cursor: pointer; background: rgba(255,255,255,.12); }
+    button.primary { background: #2b6cff; border-color: rgba(43,108,255,.5); }
+    button.danger { background: rgba(255,60,60,.18); border-color: rgba(255,60,60,.25); }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    main { padding: 14px; }
+    .card { border: 1px solid rgba(255,255,255,.10); border-radius: 14px; overflow: hidden; background: rgba(255,255,255,.04); }
+    .videoWrap { position: relative; background: #000; }
+    video { width: 100%; height: auto; display:block; }
+    .overlay {
+      position:absolute; inset:0; pointer-events:none;
+      display:flex; align-items:center; justify-content:center;
+    }
+    .box {
+      width: 78%; max-width: 520px; aspect-ratio: 3/1; /* wide barcode window */
+      border: 2px solid rgba(43,108,255,.85);
+      border-radius: 14px;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,.35);
+    }
+    .stats { display:flex; gap:10px; flex-wrap: wrap; padding: 12px; border-top: 1px solid rgba(255,255,255,.08); }
+    .pill { padding: 8px 10px; border-radius: 999px; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.10); font-size: 13px; }
+    .log { margin-top: 12px; }
+    .log h2 { font-size: 14px; margin: 0 0 8px; opacity: .9; }
+    .list { display:flex; flex-direction: column; gap: 8px; }
+    .item {
+      padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.04);
+      display:flex; justify-content: space-between; gap: 10px; align-items: center;
+    }
+    .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; word-break: break-all; }
+    .muted { opacity: .65; font-size: 12px; }
+    .status { margin-top: 10px; padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,.10); background: rgba(255,255,255,.04); }
+    .ok { border-color: rgba(43,255,130,.25); }
+    .err { border-color: rgba(255,70,70,.30); }
+    .tiny { font-size: 12px; opacity: .8; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Scanner → Google Sheet</h1>
+    <div class="row">
+      <select id="mode">
+        <option value="SCAN">SCAN</option>
+        <option value="IN">IN</option>
+        <option value="OUT">OUT</option>
+        <option value="RETURN">RETURN</option>
+        <option value="QC">QC</option>
+      </select>
+      <input id="notes" placeholder="Notes (optional)" />
+      <button id="btnStart" class="primary">Start</button>
+      <button id="btnStop" disabled>Stop</button>
+      <button id="btnTorch" disabled>Torch</button>
+      <button id="btnClear" class="danger">Clear</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="deviceId" placeholder="Device ID (auto)" />
+      <label class="pill" style="display:flex;align-items:center;gap:8px">
+        <input id="allowDuplicates" type="checkbox" />
+        Allow duplicates
+      </label>
+    </div>
+  </header>
+
+  <main>
+    <div class="card">
+      <div class="videoWrap">
+        <video id="video" playsinline muted></video>
+        <div class="overlay"><div class="box"></div></div>
+      </div>
+      <div class="stats">
+        <div class="pill">Scanned: <b id="count">0</b></div>
+        <div class="pill">Pending: <b id="pending">0</b></div>
+        <div class="pill">Last: <span id="last" class="muted">—</span></div>
+      </div>
+    </div>
+
+    <div id="status" class="status tiny">Status: idle</div>
+
+    <div class="log">
+      <h2>Recent scans</h2>
+      <div id="list" class="list"></div>
+    </div>
+  </main>
+
+  <!-- ZXing fallback (loaded only if needed) -->
+  <script>
+    // ========= CONFIG =========
+    const ENDPOINT_URL = "https://script.google.com/macros/s/AKfycbzF6vTl-fI6HT4vIvJ1NfFtmm6yUX6Tf_Ql3ckpcFv51p5Pxmgbp9n6pksvgHpOrLQu3w/exec";
+
+    // (assumption/estimation) Double-scan protection window.
+    // Prevents the same code being recorded repeatedly when the camera keeps seeing it.
+    const SAME_CODE_COOLDOWN_MS = 900;
+
+    // (assumption/estimation) How often to run detection when using BarcodeDetector.
+    const DETECT_INTERVAL_MS = 180;
+    // ==========================
+
+    const elVideo = document.getElementById("video");
+    const elStart = document.getElementById("btnStart");
+    const elStop  = document.getElementById("btnStop");
+    const elTorch = document.getElementById("btnTorch");
+    const elClear = document.getElementById("btnClear");
+    const elMode  = document.getElementById("mode");
+    const elNotes = document.getElementById("notes");
+    const elDeviceId = document.getElementById("deviceId");
+    const elAllowDup = document.getElementById("allowDuplicates");
+
+    const elCount = document.getElementById("count");
+    const elPending = document.getElementById("pending");
+    const elLast = document.getElementById("last");
+    const elList = document.getElementById("list");
+    const elStatus = document.getElementById("status");
+
+    let stream = null;
+    let track = null;
+    let scanning = false;
+
+    let lastCode = "";
+    let lastCodeAt = 0;
+
+    // simple in-memory queue; if you want offline later, we can persist to localStorage/IndexedDB
+    const queue = [];
+    let sentCount = 0;
+
+    function setStatus(msg, kind="") {
+      elStatus.classList.remove("ok","err");
+      if (kind) elStatus.classList.add(kind);
+      elStatus.textContent = "Status: " + msg;
+    }
+
+    function beep() {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = "sine";
+        o.frequency.value = 880;
+        g.gain.value = 0.04;
+        o.connect(g); g.connect(ctx.destination);
+        o.start();
+        setTimeout(() => { o.stop(); ctx.close(); }, 80);
+      } catch (_) {}
+    }
+
+    function vibrate() {
+      try { navigator.vibrate?.(60); } catch (_) {}
+    }
+
+    function getOrCreateDeviceId() {
+      const key = "scanner_device_id_v1";
+      let id = localStorage.getItem(key);
+      if (!id) {
+        id = "dev_" + Math.random().toString(36).slice(2, 10);
+        localStorage.setItem(key, id);
+      }
+      return id;
+    }
+
+    function addToUI(code) {
+      elLast.textContent = code;
+      const item = document.createElement("div");
+      item.className = "item";
+      item.innerHTML = `
+        <div class="code">${escapeHtml(code)}</div>
+        <div class="muted">${new Date().toLocaleTimeString()}</div>
+      `;
+      elList.prepend(item);
+      // keep only last 25 visible items (assumption/estimation for UI cleanliness)
+      while (elList.children.length > 25) elList.removeChild(elList.lastChild);
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+      }[c]));
+    }
+
+    function isDuplicate(code) {
+      if (elAllowDup.checked) return false;
+      const now = Date.now();
+      if (code === lastCode && (now - lastCodeAt) < SAME_CODE_COOLDOWN_MS) return true;
+      lastCode = code;
+      lastCodeAt = now;
+      return false;
+    }
+
+    async function enqueueAndSend(code) {
+      // Update counters/UI immediately
+      addToUI(code);
+      setCounts();
+
+      // Enqueue
+      const payload = {
+        barcode: code,
+        device_id: elDeviceId.value.trim(),
+        mode: elMode.value,
+        notes: elNotes.value.trim()
+      };
+      queue.push(payload);
+      setCounts();
+
+      // Fire-and-forget send (keeps scanning smooth)
+      flushQueue().catch(()=>{});
+    }
+
+    function setCounts() {
+      elCount.textContent = String(sentCount);
+      elPending.textContent = String(queue.length);
+    }
+
+    async function flushQueue() {
+      if (queue.length === 0) return;
+      // send one-by-one to keep it simple + reliable with Apps Script
+      while (queue.length > 0) {
+        const payload = queue[0];
+        try {
+          const res = await fetch(ENDPOINT_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const json = await res.json().catch(() => ({}));
+          if (!res.ok || !json.ok) throw new Error(json.error || ("HTTP " + res.status));
+          queue.shift();
+          sentCount++;
+          setCounts();
+          setStatus("uploaded ✓", "ok");
+        } catch (err) {
+          setStatus("upload failed (will retry): " + String(err), "err");
+          // stop flushing; will retry on next scan / manual start
+          break;
+        }
+      }
+    }
+
+    async function startCamera() {
+      const constraints = {
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      };
+
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      elVideo.srcObject = stream;
+      await elVideo.play();
+
+      track = stream.getVideoTracks()[0];
+
+      // enable torch button if supported
+      const caps = track.getCapabilities?.() || {};
+      elTorch.disabled = !caps.torch;
+
+      setStatus("camera started");
+    }
+
+    async function stopCamera() {
+      try { elVideo.pause(); } catch(_) {}
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+      }
+      stream = null;
+      track = null;
+      elTorch.disabled = true;
+      setStatus("camera stopped");
+    }
+
+    let torchOn = false;
+    async function toggleTorch() {
+      if (!track) return;
+      const caps = track.getCapabilities?.() || {};
+      if (!caps.torch) return;
+      torchOn = !torchOn;
+      try {
+        await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+      } catch (e) {
+        // Some phones throw even if capability exists
+        torchOn = false;
+      }
+    }
+
+    // ---------- Scanner engines ----------
+    let detector = null;
+    let detectTimer = null;
+    let zxingReader = null;
+
+    async function startScanning() {
+      scanning = true;
+      elStart.disabled = true;
+      elStop.disabled = false;
+
+      // Pick best available engine
+      if ("BarcodeDetector" in window) {
+        try {
+          const formats = await window.BarcodeDetector.getSupportedFormats?.();
+          detector = new window.BarcodeDetector({ formats: formats || undefined });
+          setStatus("scanner engine: BarcodeDetector");
+          startBarcodeDetectorLoop();
+          return;
+        } catch (e) {
+          // fall back to ZXing
+        }
+      }
+
+      setStatus("scanner engine: ZXing (fallback)");
+      await loadZXing();
+      startZXingLoop();
+    }
+
+    function stopScanning() {
+      scanning = false;
+      elStart.disabled = false;
+      elStop.disabled = true;
+
+      if (detectTimer) {
+        clearInterval(detectTimer);
+        detectTimer = null;
+      }
+
+      if (zxingReader) {
+        try { zxingReader.reset(); } catch(_) {}
+      }
+
+      setStatus("idle");
+    }
+
+    function startBarcodeDetectorLoop() {
+      if (!detector) return;
+      detectTimer = setInterval(async () => {
+        if (!scanning) return;
+        if (elVideo.readyState < 2) return; // HAVE_CURRENT_DATA
+        try {
+          const barcodes = await detector.detect(elVideo);
+          if (!barcodes || barcodes.length === 0) return;
+          const raw = (barcodes[0].rawValue || "").trim();
+          if (!raw) return;
+
+          if (isDuplicate(raw)) return;
+
+          beep(); vibrate();
+          await enqueueAndSend(raw);
+        } catch (_) {
+          // ignore frame errors
+        }
+      }, DETECT_INTERVAL_MS);
+    }
+
+    async function loadZXing() {
+      if (window.ZXing?.BrowserMultiFormatReader) return;
+      await new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = "https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js";
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    }
+
+    function startZXingLoop() {
+      zxingReader = new ZXing.BrowserMultiFormatReader();
+      // decodeFromVideoDevice keeps decoding continuously
+      zxingReader.decodeFromVideoElement(elVideo, async (result, err) => {
+        if (!scanning) return;
+        if (result && result.text) {
+          const raw = result.text.trim();
+          if (!raw) return;
+          if (isDuplicate(raw)) return;
+
+          beep(); vibrate();
+          await enqueueAndSend(raw);
+        }
+      });
+    }
+
+    // ---------- UI wiring ----------
+    elDeviceId.value = getOrCreateDeviceId();
+
+    elStart.addEventListener("click", async () => {
+      try {
+        setStatus("starting…");
+        await startCamera();
+        await startScanning();
+      } catch (e) {
+        setStatus("start failed: " + String(e), "err");
+        elStart.disabled = false;
+        elStop.disabled = true;
+      }
+    });
+
+    elStop.addEventListener("click", async () => {
+      stopScanning();
+      await stopCamera();
+    });
+
+    elTorch.addEventListener("click", async () => {
+      await toggleTorch();
+    });
+
+    elClear.addEventListener("click", () => {
+      // UI-only clear; does not delete sheet rows
+      elList.innerHTML = "";
+      lastCode = "";
+      lastCodeAt = 0;
+      setStatus("cleared recent list");
+    });
+
+    // Retry uploads when connection comes back
+    window.addEventListener("online", () => flushQueue().catch(()=>{}));
+  </script>
+</body>
+</html>
